@@ -1,0 +1,11 @@
+{
+  "name": "altitude-hackathon-system",
+  "private": true,
+  "scripts": {
+    "setup": "npm --prefix frontend install",
+    "install-all": "npm --prefix frontend install",
+    "build": "npm --prefix frontend install && npm --prefix frontend run build",
+    "start": "npm --prefix frontend run start",
+    "dev": "node scripts/start-all.js"
+  }
+}

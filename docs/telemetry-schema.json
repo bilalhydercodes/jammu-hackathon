@@ -1,0 +1,17 @@
+{
+  "deviceId": "altitude-01",
+  "ts": "optional ISO-8601 timestamp from device",
+  "sensors": {
+    "ambientTempC": "number | null",
+    "electronicsTempC": "number | null",
+    "coolantTempC": "number | null",
+    "humidityPct": "number | null",
+    "pressureHpa": "number | null",
+    "voltageV": "number | null",
+    "currentA": "number | null",
+    "powerW": "number | null",
+    "waterLevelPct": "number | null"
+  },
+  "safety": { "eStop": "boolean" },
+  "actuators": { "pump": "boolean", "peltier": "boolean", "fan": "boolean" }
+}
