@@ -2,10 +2,11 @@
   "name": "altitude-hackathon-system",
   "private": true,
   "scripts": {
-    "setup": "npm --prefix frontend install",
-    "install-all": "npm --prefix frontend install",
-    "build": "npm --prefix frontend install && npm --prefix frontend run build",
-    "start": "npm --prefix frontend run start",
+    "setup": "npm --prefix node-backend install && npm --prefix frontend install",
+    "install-all": "npm --prefix node-backend install && npm --prefix frontend install",
+    "build": "npm --prefix node-backend install",
+    "start": "node node-backend/server.js",
+    "start:gateway": "node node-backend/server.js",
     "dev": "node scripts/start-all.js"
   }
 }
