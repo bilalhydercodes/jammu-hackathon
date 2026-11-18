@@ -211,20 +211,22 @@ export default function LiveDashboard() {
   const a = telemetry?.analysis || {};
   const alerts = Array.isArray(a.alerts) ? a.alerts : [];
 
-  // Compute highest temp from real sensors (null if no data yet)
-  const highestTemp = s.highestTempC ?? s.electronicsTempC ?? (
-    [s.dsTemp1C, s.dsTemp2C, s.dsTemp3C, s.ntcTempC].filter(x => typeof x === 'number' && Number.isFinite(x)).length > 0
-      ? Math.max(...[s.dsTemp1C, s.dsTemp2C, s.dsTemp3C, s.ntcTempC].filter(x => typeof x === 'number' && Number.isFinite(x)))
-      : null
-  );
-  const isOverTemp = s.overTemp || (typeof highestTemp === 'number' && highestTemp > 35.0);
+  // Filter out disconnected or floating NTC readings (>80°C when DS18B20 are <35°C)
+  const validDsTemps = [s.dsTemp1C, s.dsTemp2C, s.dsTemp3C].filter(x => typeof x === 'number' && Number.isFinite(x) && x > -50 && x < 125);
+  const dsAvg = validDsTemps.length > 0 ? validDsTemps.reduce((a, b) => a + b, 0) / validDsTemps.length : null;
+  const isNtcDisconnected = s.ntcStatus === 'DISCONNECTED' || (s.ntcTempC != null && ((s.ntcTempC <= -900) || (dsAvg !== null && s.ntcTempC > 80.0 && dsAvg < 35.0)));
+  const validNtcTemp = isNtcDisconnected ? null : (typeof s.ntcTempC === 'number' && Number.isFinite(s.ntcTempC) && s.ntcTempC > -40 && s.ntcTempC < 120 ? s.ntcTempC : null);
+
+  const realProbes = [...validDsTemps, validNtcTemp].filter(x => x !== null);
+  const highestTemp = realProbes.length > 0 ? Math.max(...realProbes) : (typeof s.highestTempC === 'number' && s.highestTempC < 85.0 ? s.highestTempC : null);
+  const isOverTemp = typeof highestTemp === 'number' && highestTemp >= 35.0;
 
   const trends = useMemo(() => ({
-    highest: history.map(x => n(x.sensors?.highestTempC ?? x.sensors?.electronicsTempC)).filter(x => x !== null),
+    highest: history.map(x => n(x.sensors?.highestTempC)).filter(x => x !== null && x < 85.0),
     ds1: history.map(x => n(x.sensors?.dsTemp1C)).filter(x => x !== null),
     ds2: history.map(x => n(x.sensors?.dsTemp2C)).filter(x => x !== null),
     ds3: history.map(x => n(x.sensors?.dsTemp3C)).filter(x => x !== null),
-    ntc: history.map(x => n(x.sensors?.ntcTempC ?? x.sensors?.coolantTempC)).filter(x => x !== null),
+    ntc: history.map(x => n(x.sensors?.ntcTempC)).filter(x => x !== null && x < 85.0),
     water: history.map(x => n(x.sensors?.waterLevelPct)).filter(x => x !== null),
     waterAdc: history.map(x => n(x.sensors?.waterAdc)).filter(x => x !== null),
   }), [history]);
@@ -278,11 +280,10 @@ export default function LiveDashboard() {
 
       <nav className="main-nav">
         {[
-          ['overview', 'Overview'],
-          ['monitor', 'Live Monitoring'],
-          ['prototype', '3D Prototype'],
+          ['overview', 'Live Dashboard'],
+          ['prototype', '3D Digital Twin'],
           ['architecture', 'System Architecture'],
-          ['alerts', 'Events & Alerts'],
+          ['alerts', 'Safety Events & Packets'],
         ].map(([key, label]) => (
           <button key={key} className={view === key ? 'active' : ''} onClick={() => setView(key)}>
             {label}
@@ -290,7 +291,7 @@ export default function LiveDashboard() {
         ))}
       </nav>
 
-      {/* OVERVIEW TAB */}
+      {/* UNIFIED REAL-DATA LIVE DASHBOARD */}
       {view === 'overview' && (
         <main className="content">
           {!telemetry && (
@@ -313,214 +314,151 @@ export default function LiveDashboard() {
             </div>
           )}
 
-          <section className="hero-grid">
-            <div className="hero-copy">
-              <div className="eyebrow">Smart Thermal Protection System</div>
-              <h2>Multi-probe thermal supervisor with automated pump protection.</h2>
-              <p>
-                Continuous acquisition from three DS18B20 digital probes and an NTC thermistor tracks peak temperature across critical electronics.
-                When the temperature exceeds 35.0 °C, the ESP32 safety controller autonomously activates the IRF520 cooling pump, triggers the buzzer alarm, and switches status LEDs.
-              </p>
-              <div className="hero-actions">
-                <button className="primary" onClick={() => setView('monitor')}>View Live Monitoring</button>
-                <button onClick={() => setView('prototype')}>Open 3D Model</button>
-              </div>
-              <div className="hero-facts">
-                <div><strong>{value(highestTemp, ' °C')}</strong><span>Highest Temp</span></div>
-                <div><strong>35.0 °C</strong><span>Temp Limit</span></div>
-                <div><strong>{value(s.waterLevelPct, ' %', 0)}</strong><span>Water Level</span></div>
-                <div>
-                  <strong style={{ color: isOverTemp ? '#b92e25' : (telemetry ? '#146c43' : '#687582') }}>
-                    {isOverTemp ? '🔥 ALERT' : (telemetry ? '✅ SAFE' : 'NO DATA')}
-                  </strong>
-                  <span>System Health</span>
-                </div>
-              </div>
-            </div>
-            <div className="hero-preview" onClick={() => setView('prototype')}>
-              <div className="preview-copy">
-                <span>Interactive Hardware</span>
-                <strong>Explore the Thermal Setup</strong>
-                <small>3x DS18B20 · NTC 10K · IRF520 Pump · Buzzer · Water Level</small>
-              </div>
-              <div className="proto-illustration" aria-hidden="true">
-                <div className="case"><i></i><i></i><i></i><i></i><b></b></div>
-                <div className="radiator"></div><div className="reservoir"></div>
-              </div>
-            </div>
-          </section>
-
-          <section className="summary-band">
+          {/* 1. TOP LIVE SYSTEM STATUS BAR */}
+          <section className="summary-band" style={{ gridTemplateColumns: 'repeat(5, 1fr)', marginBottom: '22px' }}>
             <div>
-              <span>System Status</span>
-              <strong className={cls(isOverTemp ? 'CRITICAL' : (a.status || (telemetry ? 'NORMAL' : 'NO DATA')))}>
-                {isOverTemp ? '🔥 OVER-TEMP' : (a.status || (telemetry ? 'NORMAL' : 'WAITING'))}
+              <span>System Health</span>
+              <strong style={{ color: isOverTemp ? '#af2d24' : (telemetry ? '#146c43' : '#657383') }}>
+                {isOverTemp ? '🔥 OVER-TEMP' : (telemetry ? '✅ SAFE (NORMAL)' : 'WAITING FOR ESP32')}
               </strong>
             </div>
-            <div><span>Highest Temp</span><strong>{value(highestTemp, ' °C')}</strong></div>
-            <div><span>DS Sensor 1</span><strong>{value(s.dsTemp1C, ' °C')}</strong></div>
-            <div><span>DS Sensor 2</span><strong>{value(s.dsTemp2C, ' °C')}</strong></div>
-            <div><span>DS Sensor 3</span><strong>{value(s.dsTemp3C, ' °C')}</strong></div>
-            <div><span>NTC Temp</span><strong>{value(s.ntcTempC ?? s.coolantTempC, ' °C')}</strong></div>
-            <div><span>Water Level</span><strong>{value(s.waterLevelPct, ' %', 0)}</strong></div>
-            <div><span>Water Pump</span><strong>{telemetry?.actuators?.pump ? 'RUNNING' : (telemetry ? 'OFF' : '—')}</strong></div>
-          </section>
-
-          <section className="overview-columns">
-            <article className="panel system-card">
-              <div className="panel-heading">
-                <div><span className="section-kicker">Live Subsystem State</span><h3>Protection & Actuators</h3></div>
-                <span className={`feed-chip ${telemetry?.source || 'none'}`}>{source}</span>
-              </div>
-              <div className="system-rows">
-                <div><span>Highest Temperature</span><strong style={{ color: isOverTemp ? '#b92e25' : '#123b5d' }}>{value(highestTemp, ' °C')} (Threshold: 35.0 °C)</strong></div>
-                <div><span>Water Pump (IRF520 SIG, GPIO 12)</span><StatePill on={telemetry?.actuators?.pump} onText="RUNNING" offText="OFF" /></div>
-                <div><span>Buzzer Alarm (GPIO 17)</span><StatePill on={telemetry?.actuators?.buzzer} onText="ACTIVE" offText="SILENT" alertStyle /></div>
-                <div><span>Red Alert LED (GPIO 38)</span><StatePill on={telemetry?.actuators?.redLed} onText="ON (ALERT)" offText="OFF" alertStyle /></div>
-                <div><span>Green Safe LED (GPIO 39)</span><StatePill on={telemetry?.actuators?.greenLed} onText="ON (SAFE)" offText="OFF" /></div>
-                <div><span>Blue Wi-Fi LED (GPIO 40)</span><StatePill on={telemetry?.actuators?.blueLed} onText="CONNECTED" offText="OFF" /></div>
-                <div><span>Water Level ADC</span><strong>{s.waterAdc != null ? `${s.waterAdc} (${value(s.waterLevelPct, '%', 0)})` : '—'}</strong></div>
-              </div>
-            </article>
-
-            <article className="panel judge-card">
-              <div className="panel-heading">
-                <div><span className="section-kicker">Operation Flow</span><h3>How the System Works</h3></div>
-              </div>
-              <ol className="judge-flow">
-                <li><b>Sense</b><span>Reads 3x DS18B20 1-Wire sensors, 10k NTC thermistor via ADC, and reservoir water level.</span></li>
-                <li><b>Compute</b><span>Identifies the peak temperature probe (`highestTemp`) and compares against 35.0 °C limit.</span></li>
-                <li><b>Actuate</b><span>If temp &gt; 35.0 °C: Pump turns ON, Buzzer sounds, Red LED turns ON, Green LED turns OFF.</span></li>
-                <li><b>Stream</b><span>ESP32-S3 broadcasts JSON telemetry over local Wi-Fi to this live dashboard in real time.</span></li>
-              </ol>
-            </article>
-          </section>
-        </main>
-      )}
-
-      {/* LIVE MONITORING TAB */}
-      {view === 'monitor' && (
-        <main className="content">
-          {!telemetry && (
-            <div style={{
-              background: '#fff8e9',
-              border: '1px solid #fedf9e',
-              borderRadius: '4px',
-              padding: '12px 18px',
-              marginBottom: '16px',
-              display: 'flex',
-              alignItems: 'center',
-              gap: '12px',
-              color: '#825300',
-              fontSize: '13px'
-            }}>
-              <span style={{ fontSize: '20px' }}>📡</span>
-              <div>
-                <strong>AWAITING REAL HARDWARE:</strong> No live telemetry packets received from ESP32-S3 yet. Turn on your ESP32-S3 on the Wi-Fi network to see real-time sensor streams.
-              </div>
-            </div>
-          )}
-
-          <section className="page-title">
             <div>
-              <span className="eyebrow">Real-Time Sensor Telemetry</span>
-              <h2>Live Monitoring</h2>
-              <p>Streamed from the ESP32-S3 over Wi-Fi. Real hardware measurements only.</p>
+              <span>Peak Temperature</span>
+              <strong style={{ color: isOverTemp ? '#af2d24' : '#123b5d' }}>
+                {value(highestTemp, ' °C')}
+              </strong>
             </div>
-            <div className={`large-status ${cls(isOverTemp ? 'CRITICAL' : (a.status || (telemetry ? 'NORMAL' : 'NO DATA')))}`}>
-              <span>Current Status</span>
-              <strong>{isOverTemp ? '🔥 OVER-TEMP ALERT' : (a.status || (telemetry ? 'NORMAL' : 'WAITING FOR ESP32'))}</strong>
-              <em>Peak: {value(highestTemp, ' °C')} (Limit: 35.0 °C)</em>
+            <div>
+              <span>Safety Limit</span>
+              <strong>35.0 °C</strong>
+            </div>
+            <div>
+              <span>Cooling Actuators</span>
+              <strong style={{ color: (telemetry?.actuators?.pump || telemetry?.actuators?.peltier) ? '#146c43' : '#657383' }}>
+                {(telemetry?.actuators?.pump || telemetry?.actuators?.peltier) ? 'COOLING (ACTIVE)' : 'STANDBY (OFF)'}
+              </strong>
+            </div>
+            <div>
+              <span>Water Level</span>
+              <strong>{value(s.waterLevelPct, ' %', 0)} ({s.waterAdc != null ? `ADC ${s.waterAdc}` : '—'})</strong>
             </div>
           </section>
+
+          {/* 2. LIVE REAL SENSOR TELEMETRY */}
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
+            <div>
+              <span className="section-kicker">Real-Time Measurements</span>
+              <h3 style={{ margin: '4px 0 0', color: 'var(--navy2)', fontSize: '18px' }}>Physical Temperature & Water Sensors</h3>
+            </div>
+            <span className={`feed-chip ${telemetry?.source || 'none'}`}>{source}</span>
+          </div>
 
           <section className="metrics-grid">
             <Metric
-              title="Highest System Temp"
-              sensor="PEAK DETECTOR"
-              valueText={value(highestTemp, ' °C')}
-              trend={trends.highest}
-              note={`Threshold: 35.0 °C · ${isOverTemp ? '🚨 Triggered (>35°C)' : (telemetry ? '✅ Normal' : 'Waiting for hardware')}`}
-              highlightAlert={isOverTemp}
-            />
-            <Metric
-              title="DS18B20 Sensor 1"
-              sensor="1-Wire (GPIO 4)"
+              title="DS18B20 Probe 1"
+              sensor="1-Wire GPIO 4"
               valueText={value(s.dsTemp1C, ' °C')}
               trend={trends.ds1}
-              note="Digital Probe #1"
+              note="Digital Probe #1 (Real Hardware)"
             />
             <Metric
-              title="DS18B20 Sensor 2"
-              sensor="1-Wire (GPIO 4)"
+              title="DS18B20 Probe 2"
+              sensor="1-Wire GPIO 4"
               valueText={value(s.dsTemp2C, ' °C')}
               trend={trends.ds2}
-              note="Digital Probe #2"
+              note="Digital Probe #2 (Real Hardware)"
             />
             <Metric
-              title="DS18B20 Sensor 3"
-              sensor="1-Wire (GPIO 4)"
+              title="DS18B20 Probe 3"
+              sensor="1-Wire GPIO 4"
               valueText={value(s.dsTemp3C, ' °C')}
               trend={trends.ds3}
-              note="Digital Probe #3"
+              note="Digital Probe #3 (Real Hardware)"
             />
             <Metric
               title="NTC 10K Thermistor"
-              sensor="ADC (GPIO 1)"
-              valueText={value(s.ntcTempC ?? s.coolantTempC, ' °C')}
+              sensor="Analog GPIO 1"
+              valueText={isNtcDisconnected ? 'DISCONNECTED' : value(s.ntcTempC, ' °C')}
               trend={trends.ntc}
-              note="Steinhart-Hart B=3950"
+              note={isNtcDisconnected ? 'Pin unattached / floating' : 'Steinhart-Hart B=3950'}
+              highlightAlert={false}
             />
             <Metric
-              title="Coolant Water Level"
-              sensor="Analog (GPIO 5)"
+              title="Reservoir Water Level"
+              sensor="Analog GPIO 5"
               valueText={value(s.waterLevelPct, ' %', 0)}
               trend={trends.water}
-              note={`Raw ADC: ${s.waterAdc != null ? s.waterAdc : '—'} / 4095`}
+              note={`Raw ADC: ${s.waterAdc != null ? s.waterAdc : '0'} / 4095`}
             />
           </section>
 
-          <section className="control-layout">
+          {/* 3. ACTUATORS & HARDWARE CONTROLS */}
+          <section className="control-layout" style={{ marginTop: '22px' }}>
             <article className="panel">
               <div className="panel-heading">
                 <div>
-                  <span className="section-kicker">Reported Hardware State</span>
-                  <h3>Actuators & Status LEDs</h3>
+                  <span className="section-kicker">Hardware Actuators</span>
+                  <h3>Reported Physical States</h3>
                 </div>
                 <span>{telemetry?.receivedAt ? new Date(telemetry.receivedAt).toLocaleTimeString() : '—'}</span>
               </div>
               <div className="state-table">
-                <div><span>Highest Temperature</span><strong>{value(highestTemp, ' °C')}</strong></div>
-                <div><span>Temperature Safety Limit</span><strong>35.0 °C</strong></div>
                 <div>
-                  <span>Over-Temp Alarm</span>
-                  <strong className={isOverTemp ? 'danger-text' : 'safe-text'}>
-                    {isOverTemp ? '🔥 TRIGGERED (>35°C)' : (telemetry ? '✅ SAFE (NORMAL)' : '—')}
+                  <span>Peak Measured Temperature</span>
+                  <strong style={{ color: isOverTemp ? '#af2d24' : '#123b5d' }}>
+                    {value(highestTemp, ' °C')} (Threshold: 35.0 °C)
                   </strong>
                 </div>
-                <div><span>Water Pump (IRF520 SIG, GPIO 12)</span><StatePill on={telemetry?.actuators?.pump} onText="RUNNING" offText="OFF" /></div>
-                <div><span>Buzzer Alarm (GPIO 17)</span><StatePill on={telemetry?.actuators?.buzzer} onText="ACTIVE" offText="SILENT" alertStyle /></div>
-                <div><span>Red LED (Alarm - GPIO 38)</span><StatePill on={telemetry?.actuators?.redLed} onText="ON (ALERT)" offText="OFF" alertStyle /></div>
-                <div><span>Green LED (Safe - GPIO 39)</span><StatePill on={telemetry?.actuators?.greenLed} onText="ON (SAFE)" offText="OFF" /></div>
-                <div><span>Blue LED (Wi-Fi Link - GPIO 40)</span><StatePill on={telemetry?.actuators?.blueLed} onText="CONNECTED" offText="OFF" /></div>
-                <div><span>Water Level ADC</span><strong>{s.waterAdc != null ? `${s.waterAdc} / 4095` : '—'}</strong></div>
+                <div>
+                  <span>Water Pump (IRF520 SIG, GPIO 12)</span>
+                  <StatePill on={telemetry?.actuators?.pump} onText="RUNNING" offText="OFF" />
+                </div>
+                <div>
+                  <span>Peltier Cooler (Relay, GPIO 13)</span>
+                  <StatePill on={telemetry?.actuators?.peltier} onText="COOLING" offText="OFF" />
+                </div>
+                <div>
+                  <span>Buzzer Alarm (GPIO 17)</span>
+                  <StatePill on={telemetry?.actuators?.buzzer} onText="ACTIVE" offText="SILENT" alertStyle />
+                </div>
+                <div>
+                  <span>Normal LED (GPIO 35)</span>
+                  <StatePill on={telemetry?.actuators?.normalLed} onText="ON" offText="OFF" />
+                </div>
+                <div>
+                  <span>Red Alert LED (GPIO 38)</span>
+                  <StatePill on={telemetry?.actuators?.redLed} onText="ON (ALERT)" offText="OFF" alertStyle />
+                </div>
+                <div>
+                  <span>Green Safe LED (GPIO 39)</span>
+                  <StatePill on={telemetry?.actuators?.greenLed} onText="ON (SAFE)" offText="OFF" />
+                </div>
+                <div>
+                  <span>Blue Wi-Fi LED (GPIO 40)</span>
+                  <StatePill on={telemetry?.actuators?.blueLed} onText="CONNECTED" offText="OFF" />
+                </div>
+                <div>
+                  <span>Water Level Sensor ADC</span>
+                  <strong>{s.waterAdc != null ? `${s.waterAdc} / 4095 (${value(s.waterLevelPct, '%', 0)})` : '0 / 4095 (0%)'}</strong>
+                </div>
               </div>
             </article>
 
             <article className="panel">
               <div className="panel-heading">
                 <div>
-                  <span className="section-kicker">Prototype Control</span>
-                  <h3>Manual Actuator Test</h3>
+                  <span className="section-kicker">Actuator Testing</span>
+                  <h3>Manual Hardware Overrides</h3>
                 </div>
-                <span>ESP32 Command Queue</span>
+                <span>ESP32 Control Bus</span>
               </div>
               <div className="safety-note">
-                <b>Automatic Safety Interlock:</b> When any temperature probe exceeds 35.0 °C, the ESP32 firmware autonomously overrides manual states to run the Water Pump, Buzzer, and Red LED.
+                <b>Autonomous Safety Interlock:</b> When peak temperature reaches &ge; 35.0 °C, the ESP32 safety controller autonomously activates cooling (Pump, Peltier, Buzzer, Red LED) regardless of manual settings.
               </div>
               {[
-                ['pump', 'Water Pump (IRF520)'],
-                ['buzzer', 'Alert Buzzer'],
+                ['pump', 'Water Pump (IRF520 GPIO 12)'],
+                ['peltier', 'Peltier Cooler (Relay GPIO 13)'],
+                ['buzzer', 'Audible Alarm Buzzer (GPIO 17)'],
               ].map(([key, label]) => (
                 <div className="command-row" key={key}>
                   <span>{label}</span>

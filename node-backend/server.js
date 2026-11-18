@@ -298,13 +298,43 @@ function broadcast(event, payload) {
 
 function normalizeTelemetry(raw, source = 'hardware') {
   const now = new Date();
+  const rawSensors = raw.sensors && typeof raw.sensors === 'object' ? { ...raw.sensors } : {};
+
+  // Validate digital DS18B20 probes
+  const ds1 = typeof rawSensors.dsTemp1C === 'number' && Number.isFinite(rawSensors.dsTemp1C) && rawSensors.dsTemp1C > -50 && rawSensors.dsTemp1C < 125 ? rawSensors.dsTemp1C : null;
+  const ds2 = typeof rawSensors.dsTemp2C === 'number' && Number.isFinite(rawSensors.dsTemp2C) && rawSensors.dsTemp2C > -50 && rawSensors.dsTemp2C < 125 ? rawSensors.dsTemp2C : null;
+  const ds3 = typeof rawSensors.dsTemp3C === 'number' && Number.isFinite(rawSensors.dsTemp3C) && rawSensors.dsTemp3C > -50 && rawSensors.dsTemp3C < 125 ? rawSensors.dsTemp3C : null;
+
+  const dsValues = [ds1, ds2, ds3].filter(v => v !== null);
+  const dsAvg = dsValues.length > 0 ? dsValues.reduce((a, b) => a + b, 0) / dsValues.length : null;
+
+  // Validate NTC: if NTC reports > 80°C while DS probes are normal (< 35°C), NTC is floating/disconnected
+  let ntc = typeof rawSensors.ntcTempC === 'number' && Number.isFinite(rawSensors.ntcTempC) && rawSensors.ntcTempC > -40 ? rawSensors.ntcTempC : null;
+  if (ntc !== null && dsAvg !== null && ntc > 80.0 && dsAvg < 35.0) {
+    rawSensors.ntcStatus = 'DISCONNECTED';
+    ntc = null;
+  }
+  rawSensors.ntcTempC = ntc;
+
+  // Compute truth-verified highest temperature from real valid probes
+  const validTemps = [...dsValues, ntc].filter(v => v !== null);
+  const verifiedHighest = validTemps.length > 0 ? Math.max(...validTemps) : (rawSensors.highestTempC ?? null);
+  rawSensors.highestTempC = verifiedHighest !== null ? Number(verifiedHighest.toFixed(2)) : null;
+
+  const tempLimit = Number(rawSensors.tempLimitC || 35.0);
+  const isOverTemp = verifiedHighest !== null && verifiedHighest > tempLimit;
+  rawSensors.overTemp = isOverTemp;
+
   const sample = {
     deviceId: String(raw.deviceId || 'altitude-01'),
     ts: raw.ts || now.toISOString(),
     receivedAt: now.toISOString(),
     source,
-    sensors: raw.sensors && typeof raw.sensors === 'object' ? raw.sensors : {},
-    safety: raw.safety && typeof raw.safety === 'object' ? raw.safety : {},
+    sensors: rawSensors,
+    safety: {
+      ...raw.safety,
+      overTemp: isOverTemp,
+    },
     actuators: raw.actuators && typeof raw.actuators === 'object' ? raw.actuators : {},
   };
   return sample;

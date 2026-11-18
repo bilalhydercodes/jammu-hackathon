@@ -123,7 +123,8 @@ void initHttp(HTTPClient &http, String url) {
 float readNTCTemp() {
   int adcValue = analogRead(NTC_PIN);
   ntcRawAdc = adcValue;
-  if (adcValue <= 10 || adcValue >= 4085) return -999.0;
+  // Disconnected / open circuit check (floating near 3.3V or GND)
+  if (adcValue <= 150 || adcValue >= 3700) return -999.0;
 
   // 1. Try Standard Pull-Up: 3.3V -> 10k Resistor -> GPIO 1 -> NTC -> GND
   float resistance = SERIES_RESISTOR * ((4095.0 / (float)adcValue) - 1.0);
@@ -144,11 +145,12 @@ float readNTCTemp() {
     altSteinhart += 1.0 / (TEMP_NOMINAL + 273.15);
     altSteinhart = 1.0 / altSteinhart;
     altSteinhart -= 273.15;
-    if (altSteinhart > -10.0 && altSteinhart < 120.0) {
+    if (altSteinhart > -10.0 && altSteinhart < 85.0) {
       return altSteinhart;
     }
   }
 
+  if (steinhart < -40.0 || steinhart > 85.0) return -999.0;
   return steinhart;
 }
 
@@ -507,10 +509,17 @@ void loop() {
     }
   }
 
-  // 2. Read NTC Thermistor
+  // 2. Read NTC Thermistor (Only if valid and reasonable)
   ntcTemp = readNTCTemp();
-  if (ntcTemp != -999.0) {
-    if (ntcTemp > highestTemp) highestTemp = ntcTemp;
+  if (ntcTemp != -999.0 && ntcTemp >= -30.0 && ntcTemp <= 85.0) {
+    // If DS probes are reading normal room temp (<35C) and NTC differs by >35C, ignore outlier
+    if (highestTemp > -100.0 && (ntcTemp - highestTemp > 35.0)) {
+      ntcTemp = -999.0;
+    } else {
+      if (ntcTemp > highestTemp) highestTemp = ntcTemp;
+    }
+  } else {
+    ntcTemp = -999.0;
   }
 
   // 3. Read Water Level
