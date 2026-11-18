@@ -26,8 +26,8 @@
 const char* WIFI_SSID = "jammubhai";
 const char* WIFI_PASS = "987654321";
 
-// Render Cloud Backend:
-const char* SERVER_BASE = "https://jammu-hackathon.onrender.com";
+// Local Host Gateway (Laptop Hotspot IP):
+const char* SERVER_BASE = "http://192.168.137.1:8080";
 
 const char* DEVICE_ID = "altitude-01";
 const char* DEVICE_MODEL = "ESP32-S3";
