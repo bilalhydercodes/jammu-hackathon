@@ -191,6 +191,10 @@ class Handler(BaseHTTPRequestHandler):
         print("[health]", fmt % args)
 
 
+handler = Handler
+app = Handler
+
+
 if __name__ == "__main__":
     print(f"ALTITUDE Python health service listening on http://{HOST}:{PORT}")
     ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()

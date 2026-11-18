@@ -11,11 +11,12 @@ function apiBase() {
   }
   if (typeof window !== 'undefined') {
     const host = window.location.hostname;
-    if ((host === 'localhost' || host === '127.0.0.1' || host.startsWith('192.168.') || host.startsWith('10.')) && window.location.protocol !== 'https:') {
+    // When running standalone locally without Vercel routing (frontend on port 3000, backend on 8080)
+    if ((host === 'localhost' || host === '127.0.0.1' || host.startsWith('192.168.') || host.startsWith('10.')) && window.location.port === '3000') {
       return `http://${host}:8080`;
     }
-    // Default public tunnel for Vercel cloud deployment:
-    return 'https://altitude-live-gateway.loca.lt';
+    // On Vercel (or when unified under reverse-proxy/rewrites), use same-origin relative paths (/api/...)
+    return '';
   }
   return '';
 }

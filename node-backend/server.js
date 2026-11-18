@@ -9,7 +9,13 @@ const { URL } = require('url');
 
 const PORT = Number(process.env.PORT || 8080);
 const HOST = process.env.HOST || '0.0.0.0';
-const PYTHON_URL = process.env.PYTHON_URL || 'http://127.0.0.1:8000/analyze';
+
+function getPythonAnalyzeUrl() {
+  const base = process.env.PYTHON_SERVICE_URL || process.env.PYTHON_URL || 'http://127.0.0.1:8000';
+  if (base.endsWith('/analyze')) return base;
+  return new URL('analyze', base.endsWith('/') ? base : `${base}/`).toString();
+}
+
 const MAX_HISTORY = Number(process.env.MAX_HISTORY || 600);
 const STALE_MS = Number(process.env.STALE_MS || 5000);
 const HEARTBEAT_TIMEOUT_MS = Number(process.env.HEARTBEAT_TIMEOUT_MS || 7000);
@@ -165,11 +171,109 @@ function readJson(req) {
   });
 }
 
+function localAnalyze(payload) {
+  const sensors = payload.sensors || {};
+  const safety = payload.safety || {};
+  const actuators = payload.actuators || {};
+
+  const alerts = [];
+  let severity = 0;
+  let deductions = 0;
+
+  function flag(level, code, message, value = null) {
+    severity = Math.max(severity, level);
+    deductions += level === 1 ? 12 : 30;
+    alerts.push({ level: level === 1 ? 'WARNING' : 'CRITICAL', code, message, value });
+  }
+
+  const num = v => { const x = Number(v); return Number.isFinite(x) ? x : null; };
+
+  const ambient = num(sensors.ambientTempC);
+  const electronics = num(sensors.electronicsTempC);
+  const coolant = num(sensors.coolantTempC);
+  const water = num(sensors.waterLevelPct);
+  const voltage = num(sensors.voltageV);
+  const current = num(sensors.currentA);
+  let power = num(sensors.powerW);
+
+  let highest = num(sensors.highestTempC);
+  if (highest === null) {
+    const cands = [num(sensors.dsTemp1C), num(sensors.dsTemp2C), num(sensors.dsTemp3C), num(sensors.ntcTempC), electronics].filter(x => x !== null);
+    if (cands.length > 0) highest = Math.max(...cands);
+  }
+
+  const tempLimit = num(sensors.tempLimitC) || 35.0;
+  if (highest !== null) {
+    if (highest > tempLimit + 5.0) {
+      flag(2, 'EXTREME_OVERHEAT', `Peak temperature (${highest.toFixed(1)}°C) severely exceeds safety limit (${tempLimit.toFixed(1)}°C)! Emergency cooling active.`, highest);
+    } else if (highest > tempLimit) {
+      flag(2, 'OVER_TEMPERATURE_ALERT', `Peak temperature (${highest.toFixed(1)}°C) exceeded safety limit (${tempLimit.toFixed(1)}°C)! Water pump & buzzer activated.`, highest);
+    } else if (highest >= tempLimit - 2.5) {
+      flag(1, 'TEMPERATURE_APPROACHING_LIMIT', `Peak temperature (${highest.toFixed(1)}°C) is nearing safety threshold (${tempLimit.toFixed(1)}°C).`, highest);
+    }
+  }
+
+  if (ambient !== null) {
+    if (ambient <= -35) flag(2, 'AMBIENT_EXTREME_COLD', 'Ambient temperature is below the configured critical limit.', ambient);
+    else if (ambient <= -20) flag(1, 'AMBIENT_COLD', 'Ambient temperature is below the configured warning limit.', ambient);
+  }
+
+  if (electronics !== null) {
+    if (electronics >= 80) flag(2, 'ELECTRONICS_OVERHEAT', 'Protected electronics temperature is critically high.', electronics);
+    else if (electronics >= 65) flag(1, 'ELECTRONICS_HOT', 'Protected electronics temperature is elevated.', electronics);
+  }
+
+  if (water !== null) {
+    if (water <= 20) flag(2, 'COOLANT_LOW', 'Coolant/water level is below the critical limit; cooling must be inhibited.', water);
+    else if (water <= 35) flag(1, 'COOLANT_LEVEL_WARNING', 'Coolant/water level is low.', water);
+  }
+
+  if (voltage !== null) {
+    if (voltage <= 12.0 || voltage >= 16.9) flag(2, 'BATTERY_VOLTAGE_CRITICAL', 'Battery/bus voltage is outside the configured critical range.', voltage);
+    else if (voltage <= 12.8) flag(1, 'BATTERY_VOLTAGE_LOW', 'Battery/bus voltage is below the configured warning level.', voltage);
+  }
+
+  if (safety.eStop === true) {
+    flag(2, 'E_STOP', 'Emergency stop is active; high-power actuators must remain de-energized.', true);
+  }
+
+  const coolingInhibited = Boolean(safety.eStop) || (water !== null && water <= 20);
+  if (coolingInhibited && (actuators.pump === true || actuators.peltier === true)) {
+    flag(2, 'INTERLOCK_MISMATCH', 'Cooling actuator is reported ON while a safety interlock requires it OFF.', true);
+  }
+
+  if (power === null && voltage !== null && current !== null) {
+    power = voltage * current;
+  }
+
+  const pressure = num(sensors.pressureHpa);
+  let approxAltitude = null;
+  if (pressure !== null && pressure > 0) {
+    approxAltitude = 44330.0 * (1.0 - Math.pow(pressure / 1013.25, 0.1903));
+  }
+
+  const status = severity === 0 ? 'NORMAL' : severity === 1 ? 'WARNING' : 'CRITICAL';
+  const healthScore = Math.max(0, 100 - deductions);
+
+  return {
+    status,
+    healthScore,
+    alerts,
+    derived: {
+      powerW: power !== null ? Number(power.toFixed(3)) : null,
+      approxAltitudeM: approxAltitude !== null ? Number(approxAltitude.toFixed(1)) : null,
+      coolingInhibited,
+    },
+    analyzedAt: new Date().toISOString(),
+  };
+}
+
 async function analyze(sample) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 1200);
+  const targetUrl = getPythonAnalyzeUrl();
   try {
-    const response = await fetch(PYTHON_URL, {
+    const response = await fetch(targetUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(sample),
@@ -178,13 +282,7 @@ async function analyze(sample) {
     if (!response.ok) throw new Error(`python ${response.status}`);
     return await response.json();
   } catch (err) {
-    return {
-      status: 'UNKNOWN',
-      healthScore: null,
-      alerts: [{ level: 'WARNING', code: 'HEALTH_ENGINE_OFFLINE', message: 'Python health engine unavailable; telemetry is still being received.' }],
-      derived: {},
-      analysisError: String(err.message || err),
-    };
+    return localAnalyze(sample);
   } finally {
     clearTimeout(timeout);
   }
@@ -542,6 +640,8 @@ server.headersTimeout = 66000;
 initMongo().finally(() => {
   server.listen(PORT, HOST, () => {
     console.log(`ALTITUDE Node gateway listening on http://${HOST}:${PORT}`);
-    console.log(`Python analysis endpoint: ${PYTHON_URL}`);
+    console.log(`Python analysis endpoint: ${getPythonAnalyzeUrl()}`);
   });
 });
+
+module.exports = server;
