@@ -26,8 +26,8 @@
 const char* WIFI_SSID = "jammubhai";
 const char* WIFI_PASS = "987654321";
 
-// Public Tunnel URL for Vercel / Cloud access:
-const char* SERVER_BASE = "https://altitude-live-gateway.loca.lt";
+// Render Cloud Backend:
+const char* SERVER_BASE = "https://jammu-hackathon.onrender.com";
 
 const char* DEVICE_ID = "altitude-01";
 const char* DEVICE_MODEL = "ESP32-S3";
