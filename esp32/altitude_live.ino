@@ -1,220 +1,496 @@
 /*
-  ALTITUDE live telemetry firmware for ESP32-S3.
-  Adjust pins and calibration constants to your actual wiring before flashing.
-
-  Libraries:
-  - Adafruit BME280 Library
-  - Adafruit INA260 Library
-  - OneWire
-  - DallasTemperature
+  =============================================================================
+   SMART TEMPERATURE & PUMP PROTECTION SYSTEM (ESP32-S3)
+  =============================================================================
+   Hardware Pinout:
+   - 3x Dallas DS18B20 digital temperature sensors on 1-Wire bus (GPIO 4)
+   - 1x 10k NTC thermistor on analog ADC (GPIO 1) with Steinhart-Hart calculation
+   - 1x Analog water level sensor (GPIO 5)
+   - IRF520 MOSFET Water Pump control (GPIO 12)
+   - Audible alarm buzzer (GPIO 17)
+   - Status RGB LEDs: Red Alert (GPIO 38), Green Safe (GPIO 39), Blue Wi-Fi (GPIO 40)
+   - Autonomous safety trigger: If Highest Temp > 35.0 °C -> Pump ON, Buzzer ON, Red LED ON
+   - Real-time Wi-Fi telemetry streaming to local Node.js Gateway & Next.js dashboard
+  =============================================================================
 */
 
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
 #include <HTTPClient.h>
-#include <Wire.h>
-#include <Adafruit_BME280.h>
-#include <Adafruit_INA260.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
 #include <math.h>
 
-// ---------- CHANGE THESE ----------
-const char* WIFI_SSID = "YOUR_WIFI";
-const char* WIFI_PASS = "YOUR_PASSWORD";
-const char* SERVER_BASE = "http://192.168.1.8:8080"; // laptop IP on same Wi-Fi
+// ==================== WI-FI & SERVER CONFIGURATION ====================
+// Windows Mobile Hotspot (2.4 GHz):
+const char* WIFI_SSID = "jammubhai";
+const char* WIFI_PASS = "987654321";
+
+// Public Tunnel URL for Vercel / Cloud access:
+const char* SERVER_BASE = "https://altitude-live-gateway.loca.lt";
+
 const char* DEVICE_ID = "altitude-01";
+const char* DEVICE_MODEL = "ESP32-S3";
+const char* FIRMWARE_VERSION = "2.3.0-s3";
 
-// GPIO numbers are examples only; change to your actual PCB/wiring.
-const int PIN_DS18B20 = 4;
-const int PIN_NTC = 1;
-const int PIN_WATER = 2;
-const int PIN_ESTOP = 14;      // use an isolated/status contact; E-stop should be hardwired too
-const int PIN_PUMP = 12;
-const int PIN_PELTIER = 13;
-const int PIN_FAN = 11;
+// ==================== HARDWARE PIN CONFIGURATION ====================
+#define ONE_WIRE_BUS 4      // 3x DS18B20 Data pin
+#define NTC_PIN      1      // NTC Analog Pin (GPIO 1)
+#define WATER_PIN    5      // Water Level Analog Pin (GPIO 5)
 
-// Water sensor calibration: record raw ADC values at empty and full.
-const int WATER_RAW_EMPTY = 650;
-const int WATER_RAW_FULL = 2800;
+#define PUMP_PIN     12     // IRF520 SIG (Water Pump)
+#define BUZZER_PIN   17     // Buzzer (through transistor)
 
-// NTC 100k / B3950 with 100k series resistor.
-const float NTC_R0 = 100000.0;
-const float NTC_BETA = 3950.0;
-const float NTC_T0_K = 25.0 + 273.15;
-const float NTC_SERIES_R = 100000.0;
-const float ADC_MAX = 4095.0;
-// ----------------------------------
+#define RED_LED      38     // Red Status LED (Alarm / OverTemp)
+#define GREEN_LED    39     // Green Status LED (Normal / Safe)
+#define BLUE_LED     40     // Blue Status LED (Wi-Fi Link / Telemetry)
 
-Adafruit_BME280 bme;
-Adafruit_INA260 ina260;
-OneWire oneWire(PIN_DS18B20);
-DallasTemperature ds18b20(&oneWire);
+// ==================== SENSOR & SAFETY SETTINGS ====================
+#define TEMP_LIMIT      35.0    // Temperature Limit (Celsius)
+#define SERIES_RESISTOR 10000.0 // NTC 10k Series Resistor
+#define NTC_NOMINAL     10000.0 // 10k NTC nominal at 25°C
+#define TEMP_NOMINAL    25.0    // Nominal temperature in Celsius
+#define B_COEFFICIENT   3950.0  // Beta coefficient
 
-bool bmeOK = false;
-bool inaOK = false;
-unsigned long lastSend = 0;
-unsigned long lastCommandPoll = 0;
+// Water sensor calibration (0 - 4095)
+#define WATER_ADC_EMPTY 600
+#define WATER_ADC_FULL  2800
 
-float readNTCC() {
-  int raw = analogRead(PIN_NTC);
-  if (raw <= 0 || raw >= 4095) return NAN;
-  float rNtc = NTC_SERIES_R * ((float)raw / (ADC_MAX - (float)raw));
-  float invT = (1.0 / NTC_T0_K) + (1.0 / NTC_BETA) * log(rNtc / NTC_R0);
-  return (1.0 / invT) - 273.15;
+// ==================== OBJECTS & GLOBAL VARIABLES ====================
+OneWire oneWire(ONE_WIRE_BUS);
+DallasTemperature sensors(&oneWire);
+
+WiFiClient clientHttp;
+WiFiClientSecure clientHttps;
+
+float highestTemp = -127.0;
+float dsTemp[3]   = {-127.0, -127.0, -127.0};
+float ntcTemp     = -999.0;
+int   ntcRawAdc   = 0;
+int   waterRaw    = 0;
+float waterPct    = 0.0;
+bool  overTemp    = false;
+
+bool isRegistered = false;
+int consecutiveFailures = 0;
+const int MAX_FAILURES = 3;
+
+unsigned long lastTelemetryMs = 0;
+unsigned long lastHeartbeatMs = 0;
+unsigned long lastWiFiRetryMs = 0;
+const unsigned long TELEMETRY_INTERVAL_MS = 1500; // Send telemetry every 1.5s
+const unsigned long HEARTBEAT_INTERVAL_MS = 5000; // Heartbeat every 5s
+
+// ----------------------------------------------------
+// Helper: Initialize HTTPClient for HTTP or HTTPS
+// ----------------------------------------------------
+void initHttp(HTTPClient &http, String url) {
+  if (url.startsWith("https://")) {
+    clientHttps.setInsecure(); // Accept HTTPS tunnel certificate
+    http.begin(clientHttps, url);
+  } else {
+    http.begin(clientHttp, url);
+  }
 }
 
-float readWaterPct() {
-  int raw = analogRead(PIN_WATER);
-  float pct = 100.0 * (raw - WATER_RAW_EMPTY) / (float)(WATER_RAW_FULL - WATER_RAW_EMPTY);
+// ----------------------------------------------------
+// NTC Steinhart-Hart Temperature Calculation (Auto-detects Pull-Up vs Pull-Down)
+// ----------------------------------------------------
+float readNTCTemp() {
+  int adcValue = analogRead(NTC_PIN);
+  ntcRawAdc = adcValue;
+  if (adcValue <= 10 || adcValue >= 4085) return -999.0;
+
+  // 1. Try Standard Pull-Up: 3.3V -> 10k Resistor -> GPIO 1 -> NTC -> GND
+  float resistance = SERIES_RESISTOR * ((4095.0 / (float)adcValue) - 1.0);
+  float steinhart = resistance / NTC_NOMINAL;
+  steinhart = log(steinhart);
+  steinhart /= B_COEFFICIENT;
+  steinhart += 1.0 / (TEMP_NOMINAL + 273.15);
+  steinhart = 1.0 / steinhart;
+  steinhart -= 273.15;
+
+  // 2. If result is negative (< -10C) while DS18B20 is positive (~18C),
+  // the wiring is Pull-Down: 3.3V -> NTC -> GPIO 1 -> 10k Resistor -> GND
+  if (steinhart < -10.0) {
+    float altResistance = SERIES_RESISTOR / ((4095.0 / (float)adcValue) - 1.0);
+    float altSteinhart = altResistance / NTC_NOMINAL;
+    altSteinhart = log(altSteinhart);
+    altSteinhart /= B_COEFFICIENT;
+    altSteinhart += 1.0 / (TEMP_NOMINAL + 273.15);
+    altSteinhart = 1.0 / altSteinhart;
+    altSteinhart -= 273.15;
+    if (altSteinhart > -10.0 && altSteinhart < 120.0) {
+      return altSteinhart;
+    }
+  }
+
+  return steinhart;
+}
+
+// ----------------------------------------------------
+// Water Level Percentage Calculation
+// ----------------------------------------------------
+float readWaterLevelPct(int rawAdc) {
+  if (rawAdc <= 50) return 0.0;
+  float pct = ((float)(rawAdc - WATER_ADC_EMPTY) / (float)(WATER_ADC_FULL - WATER_ADC_EMPTY)) * 100.0;
   return constrain(pct, 0.0, 100.0);
 }
 
-void ensureWiFi() {
-  if (WiFi.status() == WL_CONNECTED) return;
+// ----------------------------------------------------
+// Wi-Fi 2.4 GHz Scan & Connection Manager
+// ----------------------------------------------------
+void scanAndConnectWiFi() {
+  Serial.println("\n[Wi-Fi] Initializing 2.4 GHz Wi-Fi Radio...");
+  WiFi.disconnect(true);
+  delay(100);
   WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-  Serial.print("Wi-Fi");
-  unsigned long start = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) {
-    delay(350); Serial.print('.');
+  WiFi.setSleep(false); // Disable modem power saving for maximum antenna signal
+
+  Serial.println("[Wi-Fi] Scanning available 2.4 GHz networks...");
+  int n = WiFi.scanNetworks();
+  bool ssidFound = false;
+
+  if (n == 0) {
+    Serial.println("❌ No 2.4 GHz Wi-Fi networks found!");
+  } else {
+    Serial.printf("Found %d visible 2.4 GHz Wi-Fi network(s):\n", n);
+    for (int i = 0; i < n; ++i) {
+      String foundSSID = WiFi.SSID(i);
+      int rssi = WiFi.RSSI(i);
+      bool isMatch = (foundSSID == WIFI_SSID);
+      Serial.printf("   [%d] %-20s (Signal: %d dBm)%s\n", i + 1, foundSSID.c_str(), rssi, isMatch ? "  <-- MATCH!" : "");
+      if (isMatch) ssidFound = true;
+    }
   }
-  Serial.println();
+
+  Serial.print("[Wi-Fi] Attempting connection to: ");
+  Serial.println(WIFI_SSID);
+
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && (millis() - start < 15000)) {
+    digitalWrite(BLUE_LED, !digitalRead(BLUE_LED));
+    delay(250);
+    Serial.print(".");
+  }
+
   if (WiFi.status() == WL_CONNECTED) {
-    Serial.print("ESP32 IP: "); Serial.println(WiFi.localIP());
+    digitalWrite(BLUE_LED, HIGH);
+    Serial.println("\n[Wi-Fi] Connected successfully!");
+    Serial.print("[Wi-Fi] IP Address: ");
+    Serial.println(WiFi.localIP());
+    Serial.print("[Wi-Fi] RSSI Signal: ");
+    Serial.print(WiFi.RSSI());
+    Serial.println(" dBm");
+  } else {
+    digitalWrite(BLUE_LED, LOW);
+    Serial.println("\n[Wi-Fi] Connection timeout. Operating in autonomous local mode.");
   }
 }
 
-String boolJson(bool v) { return v ? "true" : "false"; }
-String floatJson(float v, int digits = 2) { return isnan(v) ? "null" : String(v, digits); }
-
-void sendTelemetry() {
-  if (WiFi.status() != WL_CONNECTED) return;
-
-  ds18b20.requestTemperatures();
-  float electronicsC = ds18b20.getTempCByIndex(0);
-  if (electronicsC <= -126.0) electronicsC = NAN;
-
-  float ambientC = bmeOK ? bme.readTemperature() : NAN;
-  float humidity = bmeOK ? bme.readHumidity() : NAN;
-  float pressureHpa = bmeOK ? bme.readPressure() / 100.0F : NAN;
-  float coolantC = readNTCC();
-  float waterPct = readWaterPct();
-
-  float voltageV = inaOK ? ina260.readBusVoltage() / 1000.0F : NAN;
-  float currentA = inaOK ? ina260.readCurrent() / 1000.0F : NAN;
-  float powerW = inaOK ? ina260.readPower() / 1000.0F : NAN;
-
-  // This input should be wired so HIGH/LOW matches your isolated E-stop status contact.
-  bool eStop = digitalRead(PIN_ESTOP) == LOW;
-
-  // Report what the ESP32 output pins are currently requesting.
-  bool pump = digitalRead(PIN_PUMP) == HIGH;
-  bool peltier = digitalRead(PIN_PELTIER) == HIGH;
-  bool fan = digitalRead(PIN_FAN) == HIGH;
-
-  String body = "{";
-  body += "\"deviceId\":\"" + String(DEVICE_ID) + "\",";
-  body += "\"sensors\":{";
-  body += "\"ambientTempC\":" + floatJson(ambientC) + ",";
-  body += "\"electronicsTempC\":" + floatJson(electronicsC) + ",";
-  body += "\"coolantTempC\":" + floatJson(coolantC) + ",";
-  body += "\"humidityPct\":" + floatJson(humidity) + ",";
-  body += "\"pressureHpa\":" + floatJson(pressureHpa) + ",";
-  body += "\"voltageV\":" + floatJson(voltageV, 3) + ",";
-  body += "\"currentA\":" + floatJson(currentA, 3) + ",";
-  body += "\"powerW\":" + floatJson(powerW, 3) + ",";
-  body += "\"waterLevelPct\":" + floatJson(waterPct, 1);
-  body += "},";
-  body += "\"safety\":{\"eStop\":" + boolJson(eStop) + "},";
-  body += "\"actuators\":{";
-  body += "\"pump\":" + boolJson(pump) + ",";
-  body += "\"peltier\":" + boolJson(peltier) + ",";
-  body += "\"fan\":" + boolJson(fan);
-  body += "}}";
+// ----------------------------------------------------
+// Register Device with Backend
+// ----------------------------------------------------
+bool registerWithBackend() {
+  if (WiFi.status() != WL_CONNECTED) return false;
 
   HTTPClient http;
-  http.begin(String(SERVER_BASE) + "/api/telemetry");
+  String url = String(SERVER_BASE) + "/api/device/register";
+  initHttp(http, url);
   http.addHeader("Content-Type", "application/json");
-  int code = http.POST(body);
-  Serial.printf("POST telemetry -> %d\n", code);
-  if (code > 0) Serial.println(http.getString());
-  http.end();
-}
+  http.setTimeout(4000);
 
-bool extractBool(const String& json, const char* key, bool* found) {
-  String token = "\"" + String(key) + "\":";
-  int p = json.indexOf(token);
-  if (p < 0) { *found = false; return false; }
-  p += token.length();
-  while (p < json.length() && json[p] == ' ') p++;
-  if (json.startsWith("true", p)) { *found = true; return true; }
-  if (json.startsWith("false", p)) { *found = true; return false; }
-  *found = false; // null means leave unchanged
+  String payload = "{";
+  payload += "\"deviceId\":\"" + String(DEVICE_ID) + "\",";
+  payload += "\"model\":\"" + String(DEVICE_MODEL) + "\",";
+  payload += "\"firmware\":\"" + String(FIRMWARE_VERSION) + "\",";
+  payload += "\"ip\":\"" + WiFi.localIP().toString() + "\",";
+  payload += "\"mac\":\"" + WiFi.macAddress() + "\",";
+  payload += "\"status\":\"CONNECTED\",";
+  payload += "\"sensors\":{";
+  payload += "\"ds18b20Count\":" + String(sensors.getDeviceCount()) + ",";
+  payload += "\"ntc\":true,";
+  payload += "\"water\":true";
+  payload += "},";
+  payload += "\"hasError\":false";
+  payload += "}";
+
+  int code = http.POST(payload);
+  Serial.printf("[Backend] Registration -> HTTP %d\n", code);
+
+  if (code == 200 || code == 201 || code == 202) {
+    isRegistered = true;
+    consecutiveFailures = 0;
+    http.end();
+    return true;
+  }
+  isRegistered = false;
+  http.end();
   return false;
 }
 
-void pollCommands() {
-  if (WiFi.status() != WL_CONNECTED) return;
+// ----------------------------------------------------
+// Send Periodic Heartbeat
+// ----------------------------------------------------
+void sendHeartbeat() {
+  if (WiFi.status() != WL_CONNECTED || !isRegistered) return;
+
   HTTPClient http;
-  String url = String(SERVER_BASE) + "/api/device/command?deviceId=" + DEVICE_ID;
-  http.begin(url);
-  int code = http.GET();
-  if (code == 200) {
-    String json = http.getString();
-    bool foundPump, foundPeltier, foundFan;
-    bool reqPump = extractBool(json, "pump", &foundPump);
-    bool reqPeltier = extractBool(json, "peltier", &foundPeltier);
-    bool reqFan = extractBool(json, "fan", &foundFan);
+  String url = String(SERVER_BASE) + "/api/device/heartbeat";
+  initHttp(http, url);
+  http.addHeader("Content-Type", "application/json");
+  http.setTimeout(3000);
 
-    bool eStop = digitalRead(PIN_ESTOP) == LOW;
-    float waterPct = readWaterPct();
-    bool coolingAllowed = !eStop && waterPct > 20.0;
+  String payload = "{";
+  payload += "\"deviceId\":\"" + String(DEVICE_ID) + "\",";
+  payload += "\"model\":\"" + String(DEVICE_MODEL) + "\",";
+  payload += "\"status\":\"CONNECTED\",";
+  payload += "\"uptimeMs\":" + String(millis()) + ",";
+  payload += "\"wifiRssi\":" + String(WiFi.RSSI()) + ",";
+  payload += "\"ip\":\"" + WiFi.localIP().toString() + "\",";
+  payload += "\"hasError\":false";
+  payload += "}";
 
-    if (!coolingAllowed) {
-      digitalWrite(PIN_PUMP, LOW);
-      digitalWrite(PIN_PELTIER, LOW);
-      digitalWrite(PIN_FAN, LOW);
-    } else {
-      if (foundPump) digitalWrite(PIN_PUMP, reqPump ? HIGH : LOW);
-      if (foundPeltier) digitalWrite(PIN_PELTIER, reqPeltier ? HIGH : LOW);
-      if (foundFan) digitalWrite(PIN_FAN, reqFan ? HIGH : LOW);
-    }
+  int code = http.POST(payload);
+  if (code == 200 || code == 202) {
+    consecutiveFailures = 0;
+  } else {
+    consecutiveFailures++;
+    if (consecutiveFailures >= MAX_FAILURES) isRegistered = false;
   }
   http.end();
 }
 
-void setup() {
-  Serial.begin(115200);
-  delay(300);
-  pinMode(PIN_ESTOP, INPUT_PULLUP);
-  pinMode(PIN_PUMP, OUTPUT);
-  pinMode(PIN_PELTIER, OUTPUT);
-  pinMode(PIN_FAN, OUTPUT);
-  digitalWrite(PIN_PUMP, LOW);
-  digitalWrite(PIN_PELTIER, LOW);
-  digitalWrite(PIN_FAN, LOW);
+// ----------------------------------------------------
+// Stream Live Telemetry to Backend
+// ----------------------------------------------------
+void sendTelemetry() {
+  if (WiFi.status() != WL_CONNECTED) {
+    if (millis() - lastWiFiRetryMs > 10000) {
+      lastWiFiRetryMs = millis();
+      WiFi.begin(WIFI_SSID, WIFI_PASS);
+    }
+    return;
+  }
 
-  analogReadResolution(12);
-  Wire.begin();
-  ds18b20.begin();
-  bmeOK = bme.begin(0x76) || bme.begin(0x77);
-  inaOK = ina260.begin();
+  if (!isRegistered) {
+    if (!registerWithBackend()) return;
+  }
 
-  Serial.printf("BME280: %s | INA260: %s\n", bmeOK ? "OK" : "NOT FOUND", inaOK ? "OK" : "NOT FOUND");
-  ensureWiFi();
+  HTTPClient http;
+  String url = String(SERVER_BASE) + "/api/telemetry";
+  initHttp(http, url);
+  http.addHeader("Content-Type", "application/json");
+  http.setTimeout(3500);
+
+  bool pumpState   = (digitalRead(PUMP_PIN) == HIGH);
+  bool buzzerState = (digitalRead(BUZZER_PIN) == HIGH);
+  bool redState    = (digitalRead(RED_LED) == HIGH);
+  bool greenState  = (digitalRead(GREEN_LED) == HIGH);
+  bool blueState   = (digitalRead(BLUE_LED) == HIGH);
+
+  String payload = "{";
+  payload += "\"deviceId\":\"" + String(DEVICE_ID) + "\",";
+  payload += "\"model\":\"" + String(DEVICE_MODEL) + "\",";
+  payload += "\"deviceStatus\":\"CONNECTED\",";
+  payload += "\"sensors\":{";
+  payload += "\"highestTempC\":" + (highestTemp > -100.0 ? String(highestTemp, 2) : "null") + ",";
+  payload += "\"dsTemp1C\":" + (dsTemp[0] > -100.0 ? String(dsTemp[0], 2) : "null") + ",";
+  payload += "\"dsTemp2C\":" + (dsTemp[1] > -100.0 ? String(dsTemp[1], 2) : "null") + ",";
+  payload += "\"dsTemp3C\":" + (dsTemp[2] > -100.0 ? String(dsTemp[2], 2) : "null") + ",";
+  payload += "\"ntcTempC\":" + (ntcTemp > -900.0 ? String(ntcTemp, 2) : "null") + ",";
+  payload += "\"waterAdc\":" + String(waterRaw) + ",";
+  payload += "\"waterLevelPct\":" + String(waterPct, 1) + ",";
+  payload += "\"tempLimitC\":" + String(TEMP_LIMIT, 1) + ",";
+  payload += "\"overTemp\":" + String(overTemp ? "true" : "false");
+  payload += "},";
+  payload += "\"safety\":{";
+  payload += "\"overTemp\":" + String(overTemp ? "true" : "false");
+  payload += "},";
+  payload += "\"actuators\":{";
+  payload += "\"pump\":" + String(pumpState ? "true" : "false") + ",";
+  payload += "\"buzzer\":" + String(buzzerState ? "true" : "false") + ",";
+  payload += "\"redLed\":" + String(redState ? "true" : "false") + ",";
+  payload += "\"greenLed\":" + String(greenState ? "true" : "false") + ",";
+  payload += "\"blueLed\":" + String(blueState ? "true" : "false");
+  payload += "}}";
+
+  int code = http.POST(payload);
+  if (code == 200 || code == 202) {
+    consecutiveFailures = 0;
+  } else {
+    consecutiveFailures++;
+    if (consecutiveFailures >= MAX_FAILURES) isRegistered = false;
+  }
+  http.end();
 }
 
-void loop() {
-  ensureWiFi();
-  const unsigned long now = millis();
+// ==================== SETUP ====================
+void setup() {
+  Serial.begin(115200);
 
-  if (now - lastCommandPoll >= 700) {
-    lastCommandPoll = now;
-    pollCommands();
+  // Allow time for Serial Monitor to initialize
+  unsigned long start = millis();
+  while (!Serial && (millis() - start < 3000)) {
+    delay(10);
   }
-  if (now - lastSend >= 1000) {
-    lastSend = now;
+
+  Serial.println("\n=================================");
+  Serial.println("   SMART TEMP & PUMP SYSTEM");
+  Serial.println("=================================");
+
+  // Pin Modes
+  pinMode(PUMP_PIN, OUTPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(RED_LED, OUTPUT);
+  pinMode(GREEN_LED, OUTPUT);
+  pinMode(BLUE_LED, OUTPUT);
+
+  pinMode(NTC_PIN, INPUT);
+  pinMode(WATER_PIN, INPUT);
+
+  // Safe Initial State
+  digitalWrite(PUMP_PIN, LOW);
+  digitalWrite(BUZZER_PIN, LOW);
+  digitalWrite(RED_LED, LOW);
+  digitalWrite(GREEN_LED, HIGH); // Green on for safe standby
+  digitalWrite(BLUE_LED, LOW);
+
+  // DS18B20 1-Wire Init
+  pinMode(ONE_WIRE_BUS, INPUT_PULLUP);
+  sensors.begin();
+
+  int count = sensors.getDeviceCount();
+  Serial.print("DS18B20 Sensors Detected: ");
+  Serial.println(count);
+  if (count == 0) {
+    Serial.println("❌ Warning: No DS18B20 found. Check 4.7k pull-up resistor & wiring.");
+  }
+
+  // Scan 2.4 GHz networks & connect to Laptop Hotspot
+  scanAndConnectWiFi();
+
+  // Initial Backend Registration
+  if (WiFi.status() == WL_CONNECTED) {
+    registerWithBackend();
+  }
+
+  Serial.println("=================================\n");
+}
+
+// ==================== MAIN LOOP ====================
+void loop() {
+  unsigned long currentMs = millis();
+
+  // 1. Read DS18B20 1-Wire Temperatures
+  sensors.requestTemperatures();
+  int count = sensors.getDeviceCount();
+
+  highestTemp = -127.0;
+  overTemp = false;
+
+  Serial.println("---- LIVE SYSTEM DATA ----");
+
+  for (int i = 0; i < 3; i++) {
+    Serial.print("DS Sensor ");
+    Serial.print(i + 1);
+    Serial.print(": ");
+
+    if (i < count) {
+      float t = sensors.getTempCByIndex(i);
+      dsTemp[i] = t;
+      if (t == DEVICE_DISCONNECTED_C || t <= -126.0) {
+        Serial.println("DISCONNECTED ❌");
+      } else {
+        Serial.print(t, 2);
+        Serial.println(" C");
+        if (t > highestTemp) highestTemp = t;
+        if (t > TEMP_LIMIT) overTemp = true;
+      }
+    } else {
+      dsTemp[i] = -127.0;
+      Serial.println("NOT DETECTED");
+    }
+  }
+
+  // 2. Read NTC Thermistor
+  ntcTemp = readNTCTemp();
+  Serial.print("NTC Temp  : ");
+  if (ntcTemp == -999.0) {
+    Serial.println("ERROR (Disconnected)");
+  } else {
+    Serial.print(ntcTemp, 2);
+    Serial.print(" C  (ADC: ");
+    Serial.print(ntcRawAdc);
+    Serial.println(")");
+    if (ntcTemp > highestTemp) highestTemp = ntcTemp;
+    if (ntcTemp > TEMP_LIMIT) overTemp = true;
+  }
+
+  // 3. Read Water Level
+  waterRaw = analogRead(WATER_PIN);
+  waterPct = readWaterLevelPct(waterRaw);
+  Serial.print("Water Level: ADC ");
+  Serial.print(waterRaw);
+  Serial.print(" (");
+  Serial.print(waterPct, 1);
+  Serial.println(" %)");
+
+  // 4. Autonomous Safety & Actuator Logic
+  Serial.println("--------------------------");
+  if (overTemp) {
+    digitalWrite(PUMP_PIN, HIGH);    // Water Pump ON
+    digitalWrite(BUZZER_PIN, HIGH);  // Buzzer ON
+    digitalWrite(RED_LED, HIGH);     // Red LED ON
+    digitalWrite(GREEN_LED, LOW);    // Green LED OFF
+
+    Serial.print("🔥 ALERT! Temp > ");
+    Serial.print(TEMP_LIMIT, 1);
+    Serial.println(" C");
+    Serial.println("👉 PUMP: ON | BUZZER: ON | LED: RED");
+  } else {
+    digitalWrite(PUMP_PIN, LOW);     // Water Pump OFF
+    digitalWrite(BUZZER_PIN, LOW);   // Buzzer OFF
+    digitalWrite(RED_LED, LOW);      // Red LED OFF
+    digitalWrite(GREEN_LED, HIGH);   // Green LED ON
+
+    Serial.println("✅ Temp Normal");
+    Serial.println("👉 PUMP: OFF | BUZZER: OFF | LED: GREEN");
+  }
+
+  Serial.print("Highest Temp: ");
+  if (highestTemp <= -100.0) {
+    Serial.println("N/A");
+  } else {
+    Serial.print(highestTemp, 2);
+    Serial.println(" C");
+  }
+
+  // 5. Wi-Fi Status LED Indicator
+  if (WiFi.status() == WL_CONNECTED) {
+    digitalWrite(BLUE_LED, HIGH);
+    Serial.print("Wi-Fi Status: CONNECTED (IP: ");
+    Serial.print(WiFi.localIP());
+    Serial.println(")");
+  } else {
+    digitalWrite(BLUE_LED, LOW);
+    Serial.println("Wi-Fi Status: DISCONNECTED");
+  }
+
+  Serial.println("=================================\n");
+
+  // 6. Network Telemetry & Heartbeat Streaming
+  if (currentMs - lastTelemetryMs >= TELEMETRY_INTERVAL_MS) {
+    lastTelemetryMs = currentMs;
     sendTelemetry();
   }
-  delay(10);
+
+  if (currentMs - lastHeartbeatMs >= HEARTBEAT_INTERVAL_MS) {
+    lastHeartbeatMs = currentMs;
+    sendHeartbeat();
+  }
+
+  delay(1500); // 1.5 second loop delay
 }

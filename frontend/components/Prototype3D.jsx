@@ -3,11 +3,11 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 
 const DETAILS = {
-  controller: { title: 'ESP32-S3 Controller', text: 'Collects sensor readings, applies local interlocks and sends telemetry to the Node.js gateway over Wi-Fi.' },
-  sensor: { title: 'Environmental Sensors', text: 'BME280 tracks ambient temperature, humidity and pressure. Bonded temperature probes track protected electronics and the thermal loop.' },
-  power: { title: 'Power Monitoring', text: 'INA260 monitors bus voltage, current and power. The BMS protects the battery pack.' },
-  cooling: { title: 'Active Thermal Loop', text: 'Peltier, cold plate, pump, reservoir, radiator and fan form the prototype thermal-management path.' },
-  safety: { title: 'Independent Safety Path', text: 'Emergency-stop and NC safety relay are represented as a hardwired protection layer independent of the web controls.' },
+  controller: { title: 'ESP32-S3 Controller', text: 'Collects 3x DS18B20 1-Wire sensors, 10k NTC thermistor, and water level ADC, applying local autonomous pump protection and streaming telemetry over Wi-Fi.' },
+  sensor: { title: 'Temperature Probes', text: 'Three DS18B20 digital 1-Wire probes (GPIO 4) and an analog 10k NTC thermistor (GPIO 1) monitor temperatures across heat-generating components.' },
+  power: { title: 'Pump Driver (IRF520)', text: 'IRF520 MOSFET power module driven by GPIO 12 switches the 12V cooling pump upon high-temperature trigger (>35°C).' },
+  cooling: { title: 'Cooling Loop & Reservoir', text: 'Water level sensor (GPIO 5) monitors reservoir coolant, feeding the IRF520-driven water pump.' },
+  safety: { title: 'Alert Buzzer & Status LEDs', text: 'Audible alarm buzzer (GPIO 17) and RGB status LEDs (Red alert GPIO 38, Green normal GPIO 39, Blue Wi-Fi GPIO 40) provide immediate physical feedback.' },
 };
 
 function fmt(v, suffix = '', digits = 1) {
@@ -76,17 +76,23 @@ export default function Prototype3D({ telemetry }) {
   const [exploded, setExploded] = useState(true);
   const [autoRotate, setAutoRotate] = useState(false);
 
-  const live = useMemo(() => ({
-    status: telemetry?.analysis?.status || 'NO DATA',
-    temp: telemetry?.sensors?.electronicsTempC,
-    ambient: telemetry?.sensors?.ambientTempC,
-    water: telemetry?.sensors?.waterLevelPct,
-    voltage: telemetry?.sensors?.voltageV,
-    pump: telemetry?.actuators?.pump,
-    peltier: telemetry?.actuators?.peltier,
-    fan: telemetry?.actuators?.fan,
-    estop: telemetry?.safety?.eStop,
-  }), [telemetry]);
+  const live = useMemo(() => {
+    const highest = telemetry?.sensors?.highestTempC ?? telemetry?.sensors?.electronicsTempC;
+    const over = telemetry?.sensors?.overTemp || (typeof highest === 'number' && highest > 35.0);
+    return {
+      status: over ? 'CRITICAL' : (telemetry?.analysis?.status || 'NORMAL'),
+      temp: highest,
+      ntc: telemetry?.sensors?.ntcTempC ?? telemetry?.sensors?.coolantTempC,
+      water: telemetry?.sensors?.waterLevelPct,
+      waterAdc: telemetry?.sensors?.waterAdc,
+      pump: telemetry?.actuators?.pump,
+      buzzer: telemetry?.actuators?.buzzer,
+      redLed: telemetry?.actuators?.redLed,
+      greenLed: telemetry?.actuators?.greenLed,
+      blueLed: telemetry?.actuators?.blueLed,
+      overTemp: over,
+    };
+  }, [telemetry]);
 
   useEffect(() => {
     let renderer, controls, frame, disposed = false;
@@ -377,16 +383,16 @@ export default function Prototype3D({ telemetry }) {
             <p>{d.text}</p>
           </div>
           <div className="live-mini-grid">
-            <div><span>Ambient</span><strong>{fmt(live.ambient, ' °C')}</strong></div>
-            <div><span>Electronics</span><strong>{fmt(live.temp, ' °C')}</strong></div>
-            <div><span>Coolant level</span><strong>{fmt(live.water, ' %', 0)}</strong></div>
-            <div><span>Bus voltage</span><strong>{fmt(live.voltage, ' V', 2)}</strong></div>
+            <div><span>Highest Temp</span><strong>{fmt(live.temp, ' °C')}</strong></div>
+            <div><span>NTC Temp</span><strong>{fmt(live.ntc, ' °C')}</strong></div>
+            <div><span>Water Level</span><strong>{fmt(live.water, ' %', 0)}</strong></div>
+            <div><span>Water ADC</span><strong>{live.waterAdc != null ? String(live.waterAdc) : '—'}</strong></div>
           </div>
           <div className="actuator-list">
-            <div><span>Pump</span><strong className={live.pump ? 'state-on' : ''}>{live.pump ? 'RUNNING' : 'OFF'}</strong></div>
-            <div><span>Peltier</span><strong className={live.peltier ? 'state-on' : ''}>{live.peltier ? 'ACTIVE' : 'OFF'}</strong></div>
-            <div><span>Radiator fan</span><strong className={live.fan ? 'state-on' : ''}>{live.fan ? 'RUNNING' : 'OFF'}</strong></div>
-            <div><span>Emergency stop</span><strong className={live.estop ? 'state-danger' : 'state-safe'}>{live.estop ? 'ACTIVE' : 'SAFE'}</strong></div>
+            <div><span>Water Pump (IRF520)</span><strong className={live.pump ? 'state-on' : ''}>{live.pump ? 'RUNNING' : 'OFF'}</strong></div>
+            <div><span>Buzzer Alarm</span><strong className={live.buzzer ? 'state-danger' : ''}>{live.buzzer ? 'ACTIVE' : 'SILENT'}</strong></div>
+            <div><span>Red LED (Alarm)</span><strong className={live.redLed ? 'state-danger' : ''}>{live.redLed ? 'ON' : 'OFF'}</strong></div>
+            <div><span>Green LED (Safe)</span><strong className={live.greenLed ? 'state-safe' : ''}>{live.greenLed ? 'ON' : 'OFF'}</strong></div>
           </div>
           <div className="prototype-note">The original Blender Python generator is included in the project under <code>blender/</code>. This web version is optimized for a live hackathon demo.</div>
         </aside>

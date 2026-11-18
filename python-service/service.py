@@ -72,6 +72,23 @@ def analyze(payload):
     current = number(sensors.get("currentA"))
     power = number(sensors.get("powerW"))
 
+    # Multi-sensor checks for ESP32 Smart Temp & Pump system
+    highest = number(sensors.get("highestTempC"))
+    if highest is None:
+        cand = [number(sensors.get("dsTemp1C")), number(sensors.get("dsTemp2C")), number(sensors.get("dsTemp3C")), number(sensors.get("ntcTempC")), electronics]
+        valid_cands = [x for x in cand if x is not None]
+        if valid_cands:
+            highest = max(valid_cands)
+
+    temp_limit = number(sensors.get("tempLimitC")) or 35.0
+    if highest is not None:
+        if highest > temp_limit + 5.0:
+            flag(2, "EXTREME_OVERHEAT", f"Peak temperature ({highest:.1f}°C) severely exceeds safety limit ({temp_limit:.1f}°C)! Emergency cooling active.", highest)
+        elif highest > temp_limit:
+            flag(2, "OVER_TEMPERATURE_ALERT", f"Peak temperature ({highest:.1f}°C) exceeded safety limit ({temp_limit:.1f}°C)! Water pump & buzzer activated.", highest)
+        elif highest >= temp_limit - 2.5:
+            flag(1, "TEMPERATURE_APPROACHING_LIMIT", f"Peak temperature ({highest:.1f}°C) is nearing safety threshold ({temp_limit:.1f}°C).", highest)
+
     if ambient is not None:
         if ambient <= TH["ambient_crit_low"]:
             flag(2, "AMBIENT_EXTREME_COLD", "Ambient temperature is below the configured critical limit.", ambient)
